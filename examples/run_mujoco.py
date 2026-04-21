@@ -193,6 +193,72 @@ def get_feet_world(env) -> np.ndarray:
     except Exception:
         return None
 
+# =====================================================================
+# Locomotion: Gait and Swing Control
+# =====================================================================
+def get_trot_contact_schedule(t: float, T_gait: float = 0.5):
+    """Genera un patrón de trote (diagonales alternadas)."""
+    phase = (t % T_gait) / T_gait
+        
+    if phase < 0.5:
+        # Fase 1: FL y RR en el piso (Stance). FR y RL en el aire (Swing).
+        contact = np.array([True, False, False, True], dtype=bool)
+        sw_phase = np.array([0.0, phase/0.5, phase/0.5, 0.0])
+    else:
+        # Fase 2: FR y RL en el piso (Stance). FL y RR en el aire (Swing).
+        contact = np.array([False, True, True, False], dtype=bool)
+        sw_phase = np.array([(phase-0.5)/0.5, 0.0, 0.0, (phase-0.5)/0.5])
+            
+    return contact, sw_phase
+
+def compute_swing_torques(env, contact_mask, sw_phase, cmd_vx, cmd_vy):
+    """Controlador PD Cartesiano para mover las patas en el aire."""
+    tau_swing = np.zeros(env.mjModel.nu)
+    try:
+        jacobians = env.feet_jacobians(frame="world")
+        fp = env.feet_pos(frame="world")
+    except Exception:
+        return tau_swing
+
+    p_body = env.base_pos.copy()
+    R_WB = env.base_configuration[0:3, 0:3]
+        
+    # Ganancias del PD Cartesiano
+    Kp = 250.0
+    Kd = 15.0
+
+    for i, leg in enumerate(["FL", "FR", "RL", "RR"]):
+        if not contact_mask[i]:  # Si la pata está en el aire
+            # 1. Calcular a dónde debe aterrizar (Heurística de Raibert)
+            p_nom_body = ROBOT_FOOT_OFFSET[i].copy()
+            step_x = cmd_vx * 0.25  # v * (T_stance / 2)
+            step_y = cmd_vy * 0.25
+                
+            p_target_body = p_nom_body + np.array([step_x, step_y, 0.0])
+            # Agregar la altura (parábola) para no arrastrar el pie
+            p_target_body[2] += 0.08 * np.sin(np.pi * sw_phase[i])
+
+            p_target_world = p_body + R_WB @ p_target_body
+
+            # 2. Obtener posición y velocidad actual del pie
+            p_foot = getattr(fp, leg)
+            J_full = jacobians[leg]
+            leg_idx = env.legs_qvel_idx[leg]
+            J_leg = J_full[:, leg_idx]
+                
+            qvel_leg = env.mjData.qvel[leg_idx]
+            v_foot = J_leg @ qvel_leg
+
+            # 3. Ley de Control PD en el espacio cartesiano
+            f_swing = Kp * (p_target_world - p_foot) - Kd * v_foot
+
+            # 4. Mapear la fuerza a torques articulares usando el Jacobiano transpuesto
+            tau_leg = J_leg.T @ f_swing
+            tau_idx = env.legs_tau_idx[leg]
+            tau_swing[tau_idx] = tau_leg
+
+    return tau_swing
+
 
 # =====================================================================
 # Dynamics and references
@@ -473,7 +539,7 @@ def run(
             t = step * sim_dt
 
             x = get_state(env)
-            contact = get_contacts(env)
+            contact, sw_phase = get_trot_contact_schedule(t)
             r_feet = get_feet_world(env)
 
             cmd_vx = teleop.vx if teleop_enabled else 0.0
@@ -546,7 +612,13 @@ def run(
                     if not contact[i]:
                         current_grfs[3 * i:3 * i + 3] = 0.0
 
-            tau = grf_to_torques(env, current_grfs, contact)
+            # Torques para mantener el equilibrio (LQG/MPC)
+            tau_stance = grf_to_torques(env, current_grfs, contact)
+            # Torques para dar el paso en el aire
+            tau_swing = compute_swing_torques(env, contact, sw_phase, cmd_vx, cmd_vy)
+            
+            # Sumamos ambos y enviamos a los motores
+            tau = tau_stance + tau_swing
             _, _, terminated, _, _ = env.step(action=tau)
 
             if render:

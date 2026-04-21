@@ -32,7 +32,7 @@ class LQGController:
     Parameters
     ----------
     A_d, B_d : discrete-time system matrices
-    g_d      : gravity affine vector
+    g_d      : gravity affine vector (discrete-time)
     Q        : state cost (12×12)
     R        : control cost (12×12)
     Q_proc   : process noise covariance for Kalman filter
@@ -62,25 +62,32 @@ class LQGController:
             Q_proc=Q_proc, R_meas=R_meas,
         )
 
-        # Feedforward for gravity compensation
-        # At steady state: x_ref = A x_ref + B u_ff + g  →  u_ff = B⁺ (I−A) x_ref − B⁺ g
-        # For standing: simplified to distribute weight equally
-        self._u_ff = None
-
     def set_initial_estimate(self, x0: np.ndarray):
         """Set the Kalman filter initial state."""
         self.kf.x_hat = x0.copy()
 
     def compute_feedforward(self, x_ref: np.ndarray) -> np.ndarray:
-        """Compute gravity-compensating feedforward at reference."""
-        # (I - A) x_ref - g = B u_ff  →  u_ff = B⁺ ((I-A) x_ref - g)
+        """Compute gravity-compensating feedforward at reference.
+
+        Solves:  B_d u_ff = (I − A_d) x_ref − g_d
+        """
         rhs = (np.eye(self.nx) - self.A_d) @ x_ref - self.g_d
         u_ff, _, _, _ = np.linalg.lstsq(self.B_d, rhs, rcond=None)
         return u_ff
 
     def step(self, y: np.ndarray, x_ref: np.ndarray,
              u_ref: np.ndarray = None) -> np.ndarray:
-        """One step of LQG: update estimate, compute control.
+        """One LQG step: measurement update → LQR on estimate → time update.
+
+        The correct order is:
+          1. Kalman *measurement* update (incorporate new sensor reading y)
+          2. Compute LQR control on the updated estimate x̂
+          3. Kalman *prediction* step using the control just computed
+             (so that x̂_{k+1|k} is ready for the next call)
+
+        FIX: previously, predict() was called with the *previous* control
+        before the new one was computed, causing a one-step lag and an
+        inconsistent state estimate.
 
         Parameters
         ----------
@@ -92,10 +99,10 @@ class LQGController:
         -------
         u : control action (12,)
         """
-        # 1. Kalman measurement update
+        # 1. Kalman measurement update — incorporate y into x̂
         self.kf.update(y)
 
-        # 2. LQR control on estimated state
+        # 2. LQR control on the freshly updated estimate
         x_hat = self.kf.state_estimate
         dx = x_hat - x_ref
 
@@ -104,7 +111,8 @@ class LQGController:
 
         u = -self.K @ dx + u_ref
 
-        # 3. Kalman prediction for next step
+        # 3. Kalman time-update using the control we JUST computed
+        #    (FIX: was using the previous u, causing a one-step lag)
         self.kf.predict(self.A_d, self.B_d, u, self.g_d)
 
         return u

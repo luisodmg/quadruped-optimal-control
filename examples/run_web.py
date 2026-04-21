@@ -97,6 +97,54 @@ def get_feet_world(env):
         return np.array([fp.FL, fp.FR, fp.RL, fp.RR])
     except Exception:
         return None
+    
+# ── Locomotion: Gait and Swing Control ────────────────────────────────
+def get_trot_contact_schedule(t: float, T_gait: float = 0.5):
+    phase = (t % T_gait) / T_gait
+    if phase < 0.5:
+        contact = np.array([True, False, False, True], dtype=bool)
+        sw_phase = np.array([0.0, phase/0.5, phase/0.5, 0.0])
+    else:
+        contact = np.array([False, True, True, False], dtype=bool)
+        sw_phase = np.array([(phase-0.5)/0.5, 0.0, 0.0, (phase-0.5)/0.5])
+    return contact, sw_phase
+
+def compute_swing_torques(env, contact_mask, sw_phase, cmd_vx, cmd_vy):
+    tau_swing = np.zeros(env.mjModel.nu)
+    try:
+        jacobians = env.feet_jacobians(frame="world")
+        fp = env.feet_pos(frame="world")
+    except Exception:
+        return tau_swing
+
+    p_body = env.base_pos.copy()
+    R_WB = env.base_configuration[0:3, 0:3]
+    Kp, Kd = 250.0, 15.0
+
+    for i, leg in enumerate(["FL", "FR", "RL", "RR"]):
+        if not contact_mask[i]:
+            p_nom_body = ROBOT_FOOT_OFFSET[i].copy()
+            step_x = cmd_vx * 0.25
+            step_y = cmd_vy * 0.25
+            
+            p_target_body = p_nom_body + np.array([step_x, step_y, 0.0])
+            p_target_body[2] += 0.08 * np.sin(np.pi * sw_phase[i])
+            p_target_world = p_body + R_WB @ p_target_body
+
+            p_foot = getattr(fp, leg)
+            J_full = jacobians[leg]
+            leg_idx = env.legs_qvel_idx[leg]
+            J_leg = J_full[:, leg_idx]
+            
+            qvel_leg = env.mjData.qvel[leg_idx]
+            v_foot = J_leg @ qvel_leg
+
+            f_swing = Kp * (p_target_world - p_foot) - Kd * v_foot
+            tau_leg = J_leg.T @ f_swing
+            tau_idx = env.legs_tau_idx[leg]
+            tau_swing[tau_idx] = tau_leg
+
+    return tau_swing
 
 # ── dynamics / controllers ────────────────────────────────────────────
 def build_dynamics():
@@ -115,24 +163,43 @@ def build_ref(dyn, vx=0., vy=0., wz=0.):
     x[9:12] = [0., 0., wz]
     return x
 
-def build_controller(name, dyn, Q, R, Qf, x_ref):
+def build_controller(name, dyn, Q, R, Qf, x_ref, x0=None):
     Ad, Bd, gd = dyn.get_linear_system(x_ref)
     Ac, Bc = dyn.continuous_AB(x_ref)
+
+    # FIX: gravity_vector() is already in continuous-time units (m/s²).
+    # Do NOT divide by dt — that was blowing up the CARE solve.
+    g_cont = dyn.gravity_vector()
+
     if name == "pmp":
-        c = PontryaginController(A=Ac, B=Bc, Q_s=Q, R_u=R, Q_f=Qf,
-                                  g_aff=dyn.gravity_vector()/dyn.dt,
-                                  dt=dyn.dt, horizon=500)
-        c.solve_discrete_sweep(x_ref.copy(), x_ref)
+        c = PontryaginController(
+            A=Ac, B=Bc, Q_s=Q, R_u=R, Q_f=Qf,
+            g_aff=g_cont,          # continuous-time gravity, no /dt
+            dt=dyn.dt, horizon=500,
+        )
+        # FIX: sweep from the *actual* current state (x0), not x_ref.
+        # This gives a valid initial costate and meaningful time-varying gains.
+        sweep_x0 = x0.copy() if x0 is not None else x_ref.copy()
+        c.solve_discrete_sweep(sweep_x0, x_ref)
         return c
+
     if name == "lqg":
-        c = LQGController(A_d=Ad, B_d=Bd, g_d=gd, Q=Q*dyn.dt, R=R*dyn.dt,
-                           Q_proc=np.diag([1e-3]*3+[1e-2]*3+[5e-3]*3+[1e-2]*3),
-                           R_meas=np.diag([5e-3]*3+[2e-2]*3+[1e-2]*3+[5e-2]*3))
+        c = LQGController(
+            A_d=Ad, B_d=Bd, g_d=gd,
+            Q=Q*dyn.dt, R=R*dyn.dt,
+            Q_proc=np.diag([1e-3]*3+[1e-2]*3+[5e-3]*3+[1e-2]*3),
+            R_meas=np.diag([5e-3]*3+[2e-2]*3+[1e-2]*3+[5e-2]*3),
+        )
         c.set_initial_estimate(x_ref)
         return c
+
     if name == "mpc":
-        return MPCController(A_d=Ad, B_d=Bd, g_d=gd, Q=Q*dyn.dt, R=R*dyn.dt,
-                              Q_f=Qf*dyn.dt, N=10, mu=0.6, fz_max=150.)
+        return MPCController(
+            A_d=Ad, B_d=Bd, g_d=gd,
+            Q=Q*dyn.dt, R=R*dyn.dt,
+            Q_f=Qf*dyn.dt, N=10, mu=0.6, fz_max=150.,
+        )
+
     raise ValueError(name)
 
 # ── WebSocket server ──────────────────────────────────────────────────
@@ -215,7 +282,11 @@ def run_sim(robot_name, render, duration, allow_switch):
     current_ctrl_name = "lqg"
     x_ref = build_ref(dyn)
     u_ref = dyn.standing_control()
-    controller = build_controller(current_ctrl_name, dyn, Q, R, Qf, x_ref)
+
+    # FIX: read actual initial state from env to seed the PMP sweep correctly
+    x0_actual = get_state(env)
+    controller = build_controller(current_ctrl_name, dyn, Q, R, Qf, x_ref,
+                                  x0=x0_actual)
     ori_ekf = OrientationEKF(dt=env.mjModel.opt.timestep)
 
     sim_dt = env.mjModel.opt.timestep
@@ -224,9 +295,15 @@ def run_sim(robot_name, render, duration, allow_switch):
     n_steps = int(duration / sim_dt)
     current_grfs = u_ref.copy()
 
+    # Per-controller step counter (for PMP time-varying gains)
+    ctrl_step_idx = 0
+
     log_pos_err = []
     log_vel_err = []
     log_grf = []
+
+    p_ref = np.array([0.0, 0.0, ROBOT_HIP_HEIGHT])
+    yaw_ref = 0.0
 
     print(f"  Sim dt={sim_dt}s  ctrl={1/ctrl_dt:.0f}Hz  steps={n_steps}")
     print("  Waiting for browser connection...\n")
@@ -238,7 +315,7 @@ def run_sim(robot_name, render, duration, allow_switch):
             t = step * sim_dt
 
             x = get_state(env)
-            contact = get_contacts(env)
+            contact, sw_phase = get_trot_contact_schedule(t)
             r_feet = get_feet_world(env)
 
             # Read commands from browser
@@ -253,6 +330,7 @@ def run_sim(robot_name, render, duration, allow_switch):
                     _ = env.reset(random=False)
                     if render: env.render()
                     current_grfs = u_ref.copy()
+                    ctrl_step_idx = 0
                     log_pos_err.clear(); log_vel_err.clear(); log_grf.clear()
                     continue
 
@@ -260,13 +338,22 @@ def run_sim(robot_name, render, duration, allow_switch):
             if allow_switch and want_ctrl != current_ctrl_name:
                 try:
                     x_ref_tmp = build_ref(dyn, cmd_vx, cmd_vy, cmd_wz)
-                    controller = build_controller(want_ctrl, dyn, Q, R, Qf, x_ref_tmp)
+                    # FIX: pass current state so PMP sweep starts from reality
+                    controller = build_controller(want_ctrl, dyn, Q, R, Qf,
+                                                  x_ref_tmp, x0=x)
                     current_ctrl_name = want_ctrl
+                    ctrl_step_idx = 0
                     print(f"  [t={t:.1f}] Switched to {current_ctrl_name.upper()}")
                 except Exception as e:
                     print(f"  Switch failed: {e}")
 
+            p_ref[0] += cmd_vx * sim_dt
+            p_ref[1] += cmd_vy * sim_dt
+            yaw_ref += cmd_wz * sim_dt
+
             x_ref = build_ref(dyn, cmd_vx, cmd_vy, cmd_wz)
+            x_ref[0:2] = p_ref[0:2]
+            x_ref[8] = yaw_ref
 
             # Disturbance
             dist = np.zeros(6)
@@ -288,19 +375,38 @@ def run_sim(robot_name, render, duration, allow_switch):
             if step % ctrl_steps == 0:
                 try:
                     if current_ctrl_name == "lqg":
+                        # FIX: always use .step() so the Kalman filter runs,
+                        # never bypass it with compute_control().
                         y = x + np.random.randn(12) * np.array(
                             [5e-3]*3 + [2e-2]*3 + [1e-2]*3 + [5e-2]*3)
                         current_grfs = controller.step(y, x_ref, u_ref)
+
+                    elif current_ctrl_name == "pmp":
+                        # FIX: pass step_idx so time-varying gains are used.
+                        current_grfs = controller.compute_control(
+                            x=x, x_ref=x_ref, u_ref=u_ref,
+                            step_idx=ctrl_step_idx,
+                        )
+                        ctrl_step_idx += 1
+
                     else:
-                        current_grfs = controller.compute_control(x=x, x_ref=x_ref, u_ref=u_ref)
+                        current_grfs = controller.compute_control(
+                            x=x, x_ref=x_ref, u_ref=u_ref,
+                        )
+
                 except Exception:
                     current_grfs = u_ref.copy()
+
                 current_grfs = np.clip(current_grfs, -150., 150.)
                 for i in range(4):
                     if not contact[i]:
                         current_grfs[3*i:3*i+3] = 0.
 
-            tau = grf_to_torques(env, current_grfs, contact)
+            # Torques combinados: Stance (Fuerzas) + Swing (Cinemática)
+            tau_stance = grf_to_torques(env, current_grfs, contact)
+            tau_swing = compute_swing_torques(env, contact, sw_phase, cmd_vx, cmd_vy)
+            tau = tau_stance + tau_swing
+
             _, _, terminated, _, _ = env.step(action=tau)
             if render:
                 env.render()
@@ -343,6 +449,7 @@ def run_sim(robot_name, render, duration, allow_switch):
 
             if terminated:
                 _ = env.reset(random=False)
+                ctrl_step_idx = 0
                 if render: env.render()
 
     except KeyboardInterrupt:

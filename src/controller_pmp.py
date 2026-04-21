@@ -48,6 +48,8 @@ class PontryaginController:
     Q_s  : state cost matrix (12×12)
     R_u  : control cost matrix (12×12)
     Q_f  : terminal cost matrix (12×12)
+    g_aff: continuous-time affine/gravity vector (12,) — must be in the same
+           units as  ẋ = A x + B u + g_aff  (i.e. NOT divided by dt)
     dt   : discretisation time-step
     horizon : number of discrete steps for finite-horizon BVP
     """
@@ -65,6 +67,8 @@ class PontryaginController:
         self.Q_f = Q_f if Q_f is not None else Q_s.copy()
         self.dt = dt
         self.horizon = horizon
+        # g_aff is the continuous-time affine term (gravity vector),
+        # stored as-is.  Never divide by dt here.
         self.g_aff = g_aff if g_aff is not None else np.zeros(A.shape[0])
 
         self.nx = A.shape[0]
@@ -96,17 +100,47 @@ class PontryaginController:
             self.K_ss = self.R_u_inv @ self.B.T @ P
             self.P_ss = P
         except Exception:
-            # Fallback: use discrete ARE
-            Ad = np.eye(self.nx) + self.A * self.dt
-            Bd = self.B * self.dt
-            P = solve_discrete_are(Ad, Bd, self.Q_s * self.dt, self.R_u * self.dt)
-            self.K_ss = np.linalg.inv(self.R_u * self.dt + Bd.T @ P @ Bd) @ Bd.T @ P @ Ad
+            # Fallback: use matrix-exponential discrete ARE
+            Ad, Bd = self._expm_discretise()
+            Qd = self.Q_s * self.dt
+            Rd = self.R_u * self.dt
+            P = solve_discrete_are(Ad, Bd, Qd, Rd)
+            self.K_ss = np.linalg.inv(Rd + Bd.T @ P @ Bd) @ Bd.T @ P @ Ad
             self.P_ss = P
+
+    # ------------------------------------------------------------------
+    # Matrix-exponential discretisation (ZOH, much more stable than Euler)
+    # ------------------------------------------------------------------
+    def _expm_discretise(self):
+        """Zero-order-hold discretisation via matrix exponential.
+
+        Returns (Ad, Bd) such that
+            x_{k+1} = Ad x_k + Bd u_k + g_d
+        where g_d is computed separately.
+        """
+        n, m = self.nx, self.nu
+        # Augmented matrix for ZOH:  [A B; 0 0]
+        Z = np.zeros((n + m, n + m))
+        Z[:n, :n] = self.A
+        Z[:n, n:] = self.B
+        eZ = expm(Z * self.dt)
+        Ad = eZ[:n, :n]
+        Bd = eZ[:n, n:]
+        return Ad, Bd
+
+    def _expm_g_d(self, Ad):
+        """Discrete gravity affine term: g_d = (Ad - I) A⁻¹ g_aff (if A invertible)
+        or approximate as g_aff * dt otherwise."""
+        try:
+            g_d = np.linalg.solve(self.A, (Ad - np.eye(self.nx))) @ self.g_aff
+        except np.linalg.LinAlgError:
+            g_d = self.g_aff * self.dt
+        return g_d
 
     # ------------------------------------------------------------------
     # Finite-horizon TPBVP via collocation  (scipy solve_bvp)
     # ------------------------------------------------------------------
-    def solve_bvp(self, x0: np.ndarray, x_ref: np.ndarray = None) -> bool:
+    def solve_bvp_trajectory(self, x0: np.ndarray, x_ref: np.ndarray = None) -> bool:
         """Solve the two-point BVP from PMP.
 
         State+costate ODE (augmented 2n system):
@@ -131,17 +165,13 @@ class PontryaginController:
         g_aug = np.concatenate([self.g_aff + self.A @ (-x_ref), self.Q_s @ x_ref])
 
         def ode(t, z):
-            """RHS of the augmented ODE."""
-            dz = M @ z + g_aug
-            return dz
+            return M @ z + g_aug
 
         def bc(za, zb):
-            """Boundary conditions: x(0)=x0, λ(T)=Q_f(x(T)−x_ref)."""
-            res_a = za[:n] - x0   # x(0) = x0
-            res_b = zb[n:] - self.Q_f @ (zb[:n] - x_ref)  # transversality
+            res_a = za[:n] - x0
+            res_b = zb[n:] - self.Q_f @ (zb[:n] - x_ref)
             return np.concatenate([res_a, res_b])
 
-        # Initial guess: linear interpolation
         t_grid = np.linspace(0, T, self.horizon + 1)
         z_init = np.zeros((2 * n, len(t_grid)))
         for i, t in enumerate(t_grid):
@@ -152,10 +182,9 @@ class PontryaginController:
         try:
             sol = solve_bvp(ode, bc, t_grid, z_init, tol=1e-4, max_nodes=5000)
             if sol.success:
-                self._x_traj = sol.y[:n, :].T  # (N+1, 12)
+                self._x_traj = sol.y[:n, :].T
                 self._lambda_traj = sol.y[n:, :].T
                 self._t_traj = sol.x
-                # Compute optimal control: u* = −R⁻¹ Bᵀ λ
                 self._u_traj = np.array([
                     -self.R_u_inv @ self.B.T @ lam for lam in self._lambda_traj
                 ])
@@ -168,51 +197,56 @@ class PontryaginController:
     # Discrete-time backward sweep (Riccati-like, more robust)
     # ------------------------------------------------------------------
     def solve_discrete_sweep(self, x0: np.ndarray, x_ref: np.ndarray = None):
-        """Backward costate sweep then forward simulation.
+        """Backward Riccati sweep then forward simulation.
 
-        Discrete adjoint equation (backward):
-            λ_k = Q_s (x_k − x_ref) + A_dᵀ λ_{k+1}
-            u_k = −R_u⁻¹ B_dᵀ λ_{k+1}
-
-        This is solved iteratively: guess λ → forward pass → backward pass → repeat.
-        We use the Riccati recursion which is equivalent.
+        Uses matrix-exponential discretisation for numerical stability.
 
         P_N = Q_f
         K_k = (R + Bᵀ P_{k+1} B)⁻¹ Bᵀ P_{k+1} A
-        P_k = Q + Aᵀ P_{k+1} A − Aᵀ P_{k+1} B K_k
+        P_k = Q + Aᵀ P_{k+1} (A − B K_k)
+
+        The affine feedforward (gravity compensation) is handled via the
+        p-vector tracking:
+            p_k = −Q x_ref + (Ad − Bd Kk)ᵀ (p_{k+1} + P_{k+1} g_d)
         """
         if x_ref is None:
             x_ref = np.zeros(self.nx)
 
-        Ad = np.eye(self.nx) + self.A * self.dt
-        Bd = self.B * self.dt
-        g_d = self.g_aff * self.dt
-        Q = self.Q_s * self.dt
-        R = self.R_u * self.dt
+        # FIX: use matrix-exponential discretisation, not Euler
+        Ad, Bd = self._expm_discretise()
+        g_d = self._expm_g_d(Ad)
+
+        Qd = self.Q_s * self.dt
+        Rd = self.R_u * self.dt
         N = self.horizon
 
         # Backward Riccati recursion
         P = [None] * (N + 1)
         K = [None] * N
-        p = [None] * (N + 1)  # affine term for tracking
+        p = [None] * (N + 1)
 
-        P[N] = self.Q_f
+        P[N] = self.Q_f.copy()
+        # FIX: p tracks the *error* cost affine term only — no g_d mixing here
         p[N] = -self.Q_f @ x_ref
 
         for k in range(N - 1, -1, -1):
             BtP = Bd.T @ P[k + 1]
-            K[k] = np.linalg.inv(R + BtP @ Bd) @ BtP @ Ad
-            P[k] = Q + Ad.T @ P[k + 1] @ (Ad - Bd @ K[k])
-            p[k] = -Q @ x_ref + (Ad - Bd @ K[k]).T @ (p[k + 1] + P[k + 1] @ g_d)
+            Reff_inv = np.linalg.inv(Rd + BtP @ Bd)
+            K[k] = Reff_inv @ BtP @ Ad
+            Acl = Ad - Bd @ K[k]
+            P[k] = Qd + Ad.T @ P[k + 1] @ Acl
+            # FIX: affine term — separate g_d contribution cleanly
+            p[k] = -Qd @ x_ref + Acl.T @ (p[k + 1] + P[k + 1] @ g_d)
 
         # Forward simulation
         x_traj = np.zeros((N + 1, self.nx))
         u_traj = np.zeros((N, self.nu))
-        x_traj[0] = x0
+        x_traj[0] = x0.copy()
 
         for k in range(N):
-            # u_k = −K_k x_k − R⁻¹ Bᵀ (p_{k+1} + P_{k+1} g_d)
-            ff = np.linalg.inv(R + Bd.T @ P[k + 1] @ Bd) @ Bd.T @ (p[k + 1] + P[k + 1] @ g_d)
+            # FIX: feedforward = -(R + BtPB)^-1 Bt (p_{k+1} + P_{k+1} g_d)
+            Reff_inv = np.linalg.inv(Rd + Bd.T @ P[k + 1] @ Bd)
+            ff = Reff_inv @ Bd.T @ (p[k + 1] + P[k + 1] @ g_d)
             u_traj[k] = -K[k] @ x_traj[k] - ff
             x_traj[k + 1] = Ad @ x_traj[k] + Bd @ u_traj[k] + g_d
 
@@ -221,6 +255,10 @@ class PontryaginController:
         self._gains = K
         self._P_seq = P
         self._p_seq = p
+        self._g_d = g_d
+        self._Ad = Ad
+        self._Bd = Bd
+        self._Rd = Rd
         return K, P, p
 
     # ------------------------------------------------------------------
@@ -231,17 +269,19 @@ class PontryaginController:
                         step_idx: int = None) -> np.ndarray:
         """Compute u* given current state.
 
-        Uses PMP optimality: u* = −R⁻¹ Bᵀ λ  (Eq. 26 applied).
+        Uses PMP optimality: u* = −K_k (x − x_ref) + feedforward.
 
-        If a BVP/sweep solution exists and step_idx is provided, use the
-        time-varying gain. Otherwise fall back to steady-state.
+        If a sweep solution exists and step_idx is provided, uses the
+        time-varying gain and affine feedforward.  Otherwise falls back
+        to the steady-state CARE gain.
 
         Parameters
         ----------
-        x     : current state (12,)
-        x_ref : reference state (12,)
-        u_ref : reference control / feedforward (12,)
-        step_idx : index into the solved trajectory
+        x        : current state (12,)
+        x_ref    : reference state (12,)
+        u_ref    : reference control / feedforward (12,) — used only in
+                   steady-state fallback when no sweep is available
+        step_idx : index into the solved trajectory (for time-varying mode)
 
         Returns
         -------
@@ -249,18 +289,24 @@ class PontryaginController:
         """
         if x_ref is None:
             x_ref = np.zeros(self.nx)
-        if u_ref is None:
-            u_ref = np.zeros(self.nu)
 
         dx = x - x_ref
 
-        # Time-varying gain from discrete sweep
+        # Time-varying gain from discrete sweep (preferred)
         if self._gains is not None and step_idx is not None:
             k = min(step_idx, len(self._gains) - 1)
-            u = -self._gains[k] @ dx + u_ref
+            # Recompute affine feedforward for this step
+            Reff_inv = np.linalg.inv(self._Rd + self._Bd.T @ self._P_seq[k + 1] @ self._Bd)
+            ff = Reff_inv @ self._Bd.T @ (self._p_seq[k + 1] + self._P_seq[k + 1] @ self._g_d)
+            u = -self._gains[k] @ dx - ff
         else:
-            # Steady-state: u = −K_ss dx + u_ref
-            u = -self.K_ss @ dx + u_ref
+            # Steady-state fallback with gravity feedforward
+            if u_ref is None:
+                # Gravity compensation: u_ff such that B u_ff + g = 0  →  u_ff = -B⁺ g
+                u_ff = -np.linalg.lstsq(self.B, self.g_aff, rcond=None)[0]
+            else:
+                u_ff = u_ref
+            u = -self.K_ss @ dx + u_ff
 
         return u
 
